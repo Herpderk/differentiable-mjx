@@ -1047,10 +1047,10 @@ def _box_box_scale(vertices_a: jax.Array, vertices_b: jax.Array) -> jax.Array:
 
 # Box-box compounds several soft feature selections, so its operational
 # softness is lower than the 1e-3 used by the simpler primitive feature gates.
-# With dimensionless RMS-normalized scores, 3e-4 widens SAT transitions while
-# preserving stable manifolds; the sweep begins to show material manifold bias
-# at 1e-3.
-_BOX_BOX_SOFTNESS = 3e-4
+# With dimensionless RMS-normalized scores, 1e-4 retains useful SAT transition
+# gradients while prioritizing hard-manifold fidelity; the sweep begins to show
+# material manifold bias at 1e-3.
+_BOX_BOX_SOFTNESS = 1e-4
 
 
 def _box_box_impl_soft(

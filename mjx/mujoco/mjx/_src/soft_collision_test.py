@@ -348,7 +348,7 @@ class SoftCollisionTest(parameterized.TestCase):
         box_a, box_b, 'smooth', softness=1e-3
     )
 
-    self.assertEqual(collision_convex._BOX_BOX_SOFTNESS, 3e-4)
+    self.assertEqual(collision_convex._BOX_BOX_SOFTNESS, 1e-4)
     jax.tree_util.tree_map(
         np.testing.assert_array_equal, tuned, explicit
     )
