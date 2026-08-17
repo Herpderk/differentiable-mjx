@@ -122,10 +122,30 @@ def _soft_select(
     maximize: bool = False,
 ) -> jax.Array:
   """Returns a scale-free SoftIndex with deterministic first-index ties."""
-  priority = jp.arange(score.shape[0], dtype=score.dtype)
-  bias = jp.sqrt(jp.asarray(softness, dtype=score.dtype)) * priority
   invalid = jp.min(score) - 1.0 if maximize else jp.max(score) + 1.0
   score = sj.where(valid.astype(score.dtype), score, invalid)
+
+  # Only bias candidates tied at the unperturbed optimum.  Biasing every
+  # candidate can reorder distinct features once softness is large enough to
+  # provide useful gradients.  The roundoff-scale tie guard preserves those
+  # features while retaining MJX's first-index convention under transforms.
+  best = jp.max(score) if maximize else jp.min(score)
+  tie_tolerance = (
+      32.0
+      * jp.finfo(score.dtype).eps
+      * jp.maximum(jp.abs(best), 1.0)
+  )
+  tied = jp.logical_and(
+      valid.astype(bool), jp.abs(score - best) <= tie_tolerance
+  )
+  priority = jp.arange(score.shape[0], dtype=score.dtype)
+  first = jp.argmax(tied.astype(score.dtype)).astype(score.dtype)
+  relative_priority = jp.maximum(priority - first, 0.0)
+  bias = (
+      jp.sqrt(jp.asarray(softness, dtype=score.dtype))
+      * relative_priority
+      * tied
+  )
   score = score - bias if maximize else score + bias
   # Translation and one-sided saturation are selection-invariant outside the
   # smoothing band.  They avoid loss of precision in the C2 projection for
@@ -1025,6 +1045,14 @@ def _box_box_scale(vertices_a: jax.Array, vertices_b: jax.Array) -> jax.Array:
   return jp.sqrt(jp.maximum(0.5 * (radius_sq_a + radius_sq_b), 1e-12))
 
 
+# Box-box compounds several soft feature selections, so its operational
+# softness is lower than the 1e-3 used by the simpler primitive feature gates.
+# With dimensionless RMS-normalized scores, 3e-4 widens SAT transitions while
+# preserving stable manifolds; the sweep begins to show material manifold bias
+# at 1e-3.
+_BOX_BOX_SOFTNESS = 3e-4
+
+
 def _box_box_impl_soft(
     faces_a: jax.Array,
     faces_b: jax.Array,
@@ -1035,7 +1063,7 @@ def _box_box_impl_soft(
     unique_edges_a: jax.Array,
     unique_edges_b: jax.Array,
     mode: str,
-    softness: float = 1e-6,
+    softness: float = _BOX_BOX_SOFTNESS,
 ) -> Tuple[jax.Array, jax.Array, jax.Array]:
   """Runs a soft SAT box collision that converges to `_box_box_impl`."""
   axes, degenerate_axes = _box_box_axes_soft(
@@ -1195,7 +1223,7 @@ def _box_box_soft(
     b1: ConvexInfo,
     b2: ConvexInfo,
     mode: str,
-    softness: float = 1e-6,
+    softness: float = _BOX_BOX_SOFTNESS,
 ) -> Collision:
   """Soft box-box collision in the second box's local frame."""
   to_local_pos = b2.mat.T @ (b1.pos - b2.pos)

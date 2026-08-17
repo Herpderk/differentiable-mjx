@@ -327,6 +327,60 @@ class SoftCollisionTest(parameterized.TestCase):
         _sort_rows(tight[1]), _sort_rows(hard[1]), atol=1e-4
     )
 
+  def test_box_box_operational_softness_calibration(self):
+    angle = 0.23
+    mat = jp.array([
+        [jp.cos(angle), -jp.sin(angle), 0.0],
+        [jp.sin(angle), jp.cos(angle), 0.0],
+        [0.0, 0.0, 1.0],
+    ])
+    box_a = _box((0.0, 0.0, 0.0))
+    box_b = _box((0.31, 0.04, 0.03), mat=mat)
+    hard = collision_convex._box_box(box_a, box_b)
+    tuned = collision_convex._box_box_soft(box_a, box_b, 'smooth')
+    explicit = collision_convex._box_box_soft(
+        box_a,
+        box_b,
+        'smooth',
+        softness=collision_convex._BOX_BOX_SOFTNESS,
+    )
+    biased = collision_convex._box_box_soft(
+        box_a, box_b, 'smooth', softness=1e-3
+    )
+
+    self.assertEqual(collision_convex._BOX_BOX_SOFTNESS, 3e-4)
+    jax.tree_util.tree_map(
+        np.testing.assert_array_equal, tuned, explicit
+    )
+    np.testing.assert_allclose(tuned[0], hard[0], atol=1e-4)
+    np.testing.assert_allclose(tuned[2], hard[2], atol=1e-4)
+    np.testing.assert_allclose(
+        _sort_rows(tuned[1]), _sort_rows(hard[1]), atol=1e-4
+    )
+    self.assertGreater(
+        _contact_set_error(biased[1], hard[1]),
+        _contact_set_error(tuned[1], hard[1]) + 1e-3,
+    )
+
+    # At a nearby SAT feature transition, the operational value supplies a
+    # useful gradient where the 1e-6 hard-limit value has already saturated.
+    def normal_y(offset, softness):
+      moving = _box((0.31, offset, 0.03), mat=mat)
+      return collision_convex._box_box_soft(
+          box_a, moving, 'smooth', softness=softness
+      )[2][0, 1]
+
+    hard_limit_grad = jax.grad(
+        lambda offset: normal_y(offset, 1e-6)
+    )(jp.array(0.035))
+    tuned_grad = jax.grad(
+        lambda offset: normal_y(
+            offset, collision_convex._BOX_BOX_SOFTNESS
+        )
+    )(jp.array(0.035))
+    self.assertLess(abs(float(hard_limit_grad)), 1e-5)
+    self.assertGreater(abs(float(tuned_grad)), 1.0)
+
   def test_box_box_tie_priority_and_edge_padding(self):
     idx = collision_convex._soft_select(jp.zeros(4), jp.ones(4), 'c2', 1e-6)
     np.testing.assert_array_equal(idx, jp.array([1.0, 0.0, 0.0, 0.0]))
