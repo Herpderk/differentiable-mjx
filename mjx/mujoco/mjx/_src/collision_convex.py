@@ -114,6 +114,63 @@ def _closest_segment_point_plane(
   return segment_point
 
 
+def _soft_select(
+    score: jax.Array,
+    valid: jax.Array,
+    mode: str,
+    softness: float,
+    maximize: bool = False,
+) -> jax.Array:
+  """Returns a scale-free SoftIndex with deterministic first-index ties."""
+  priority = jp.arange(score.shape[0], dtype=score.dtype)
+  bias = jp.sqrt(jp.asarray(softness, dtype=score.dtype)) * priority
+  invalid = jp.min(score) - 1.0 if maximize else jp.max(score) + 1.0
+  score = sj.where(valid.astype(score.dtype), score, invalid)
+  score = score - bias if maximize else score + bias
+  # Translation and one-sided saturation are selection-invariant outside the
+  # smoothing band.  They avoid loss of precision in the C2 projection for
+  # masked candidates and configurations with very large separation.
+  if maximize:
+    score = jp.maximum(score - jp.max(score), -10.0)
+  else:
+    score = jp.minimum(score - jp.min(score), 10.0)
+  select = sj.argmax if maximize else sj.argmin
+  return select(
+      score,
+      mode=mode,
+      softness=softness,
+      standardize=False,
+  )
+
+
+def _safe_normalize(x: jax.Array) -> jax.Array:
+  """Normalizes a vector with a deterministic finite zero-vector fallback."""
+  norm_sq = jp.sum(x * x)
+  norm = jp.sqrt(jp.maximum(norm_sq, 1e-24))
+  fallback = jp.zeros_like(x).at[0].set(1.0)
+  return jp.where(norm_sq > 1e-24, x / norm, fallback)
+
+
+def _closest_segment_point_plane_soft(
+    a: jax.Array,
+    b: jax.Array,
+    p0: jax.Array,
+    plane_normal: jax.Array,
+    mode: str,
+    softness: float,
+) -> jax.Array:
+  """Soft counterpart of `_closest_segment_point_plane`."""
+  d = jp.sum(p0 * plane_normal)
+  denom = jp.sum(plane_normal * (b - a))
+  denom = jp.where(denom == 0.0, 1e-6, denom)
+  t = (d - jp.sum(plane_normal * a)) / denom
+  # C2's compact polynomial can overflow for irrelevant, near-parallel plane
+  # intersections.  This bound is outside the subsequent [0, 1] clip.
+  t = jp.clip(t, -100.0, 100.0)
+  t = sj.clip(t, 0.0, 1.0, softness=softness, mode=mode)
+  return a + t * (b - a)
+
+
 def _manifold_points(
     poly: jax.Array, poly_mask: jax.Array, poly_norm: jax.Array
 ) -> jax.Array:
@@ -138,47 +195,49 @@ def _manifold_points(
   d_idx = (dist_bp + dist_ap).argmax() % poly.shape[0]
   return jp.array([a_idx, b_idx, c_idx, d_idx])
 
-def _manifold_points_soft(poly: jax.Array,
-                          poly_mask: jax.Array,
-                          poly_norm: jax.Array,
-                          mode: str,
-                          softness: float) -> jax.Array:
-    """Chooses four points on the polygon with approximately maximal area using softargmax.
-    Args:
-        poly: (N, 3) array of polygon vertices
-        poly_mask: (N,) boolean array of which vertices are in contact
-        poly_norm: (3,) normal vector of the polygon plane
-        mode: softargmax mode to use
-    """
-    s, m = softness, mode
-    dist_mask = sj.where(poly_mask, 0.0, -1e6) #- 1e6 * jp.arange(poly.shape[0]) # add small bias to prefer earlier vertices in case of ties
 
-    # A: soft argmax over masked distances (picks first valid vertex)
-    a_logits = dist_mask
-    a_idx = sj.argmax(a_logits, mode=m, softness=s)
-    a = sj.dynamic_index_in_dim(poly, a_idx, axis=0, keepdims=False)
+def _manifold_points_soft(
+    poly: jax.Array,
+    poly_mask: jax.Array,
+    poly_norm: jax.Array,
+    mode: str,
+    softness: float,
+    scale: Optional[jax.Array] = None,
+) -> jax.Array:
+  """Chooses four soft polygon indices with the hard tie convention."""
+  if scale is None:
+    centered = poly - jp.mean(poly, axis=0)
+    scale = jp.sqrt(jp.mean(jp.sum(centered * centered, axis=1)))
+  score_scale = jp.maximum(scale * scale, 1e-12)
+  valid = poly_mask.astype(poly.dtype)
 
-    # B: soft argmax of distance from A
-    b_logits = (((a - poly) ** 2).sum(axis=1)) + dist_mask
-    b_idx = sj.argmax(b_logits, mode=m, softness=s)
-    b = sj.dynamic_index_in_dim(poly, b_idx, axis=0, keepdims=False)
+  a_idx = _soft_select(
+      jp.zeros(poly.shape[0], dtype=poly.dtype),
+      valid,
+      mode,
+      softness,
+      maximize=True,
+  )
+  a = sj.dynamic_index_in_dim(poly, a_idx, axis=0, keepdims=False)
 
-    # C: soft argmax farthest from AB line
-    ab = jp.cross(poly_norm, a - b)
-    ap = a - poly
-    c_logits = sj.abs(ap.dot(ab), mode=m, softness=s) + dist_mask #+ tiebreak
-    c_idx = sj.argmax(c_logits, mode=m, softness=s)
-    c = sj.dynamic_index_in_dim(poly, c_idx, axis=0, keepdims=False)
+  b_score = jp.sum((a - poly) ** 2, axis=1) / score_scale
+  b_idx = _soft_select(b_score, valid, mode, softness, maximize=True)
+  b = sj.dynamic_index_in_dim(poly, b_idx, axis=0, keepdims=False)
 
-    # D: softargmax farthest from AC and BC
-    ac = jp.cross(poly_norm, a - c)
-    bc = jp.cross(poly_norm, b - c)
-    bp = b - poly
-    dist_bp = sj.abs(bp.dot(bc), mode=m, softness=s) + dist_mask
-    dist_ap = sj.abs(ap.dot(ac), mode=m, softness=s) + dist_mask
-    d_logits = dist_bp + dist_ap
-    d_idx = sj.argmax(d_logits, mode=m, softness=s)
-    return jp.stack([a_idx, b_idx, c_idx, d_idx])
+  ab = jp.cross(poly_norm, a - b)
+  ap = a - poly
+  c_score = sj.abs(ap.dot(ab) / score_scale, mode=mode, softness=softness)
+  c_idx = _soft_select(c_score, valid, mode, softness, maximize=True)
+  c = sj.dynamic_index_in_dim(poly, c_idx, axis=0, keepdims=False)
+
+  ac = jp.cross(poly_norm, a - c)
+  bc = jp.cross(poly_norm, b - c)
+  bp = b - poly
+  d_score = sj.abs(bp.dot(bc) / score_scale, mode=mode, softness=softness)
+  d_score += sj.abs(ap.dot(ac) / score_scale, mode=mode, softness=softness)
+  d_idx = _soft_select(d_score, valid, mode, softness, maximize=True)
+  return jp.stack([a_idx, b_idx, c_idx, d_idx])
+
 
 @collider(ncon=4)
 def plane_convex(
@@ -536,6 +595,67 @@ def _clip_edge_to_planes(
   return new_ps, jp.array([mask, mask])
 
 
+def _clip_edge_to_planes_soft(
+    edge_p0: jax.Array,
+    edge_p1: jax.Array,
+    plane_pts: jax.Array,
+    plane_normals: jax.Array,
+    mode: str,
+    softness: float,
+    scale: jax.Array,
+) -> Tuple[jax.Array, jax.Array]:
+  """Soft counterpart of `_clip_edge_to_planes`."""
+  p0, p1 = edge_p0, edge_p1
+  score_scale = jp.maximum(scale * scale, 1e-12)
+  p0_score = jax.vmap(jp.dot)(p0 - plane_pts, plane_normals)
+  p1_score = jax.vmap(jp.dot)(p1 - plane_pts, plane_normals)
+  p0_in_front = sj.greater(
+      (p0_score - 1e-6) / score_scale,
+      0.0,
+      softness=softness,
+      mode=mode,
+  )
+  p1_in_front = sj.greater(
+      (p1_score - 1e-6) / score_scale,
+      0.0,
+      softness=softness,
+      mode=mode,
+  )
+
+  candidate_clipped_ps = jax.vmap(
+      _closest_segment_point_plane_soft,
+      in_axes=[None, None, 0, 0, None, None],
+  )(p0, p1, plane_pts, plane_normals, mode, softness)
+
+  def clip_edge_point(p0, p1, in_front, clipped_ps):
+    new_edge_ps = sj.where(in_front[:, None], clipped_ps, p0)
+    dists = jp.dot(new_edge_ps - p0, p1 - p0) / score_scale
+    idx = _soft_select(
+        dists,
+        jp.ones_like(dists),
+        mode,
+        softness,
+        maximize=True,
+    )
+    return sj.dynamic_index_in_dim(new_edge_ps, idx, axis=0, keepdims=False)
+
+  new_p0 = clip_edge_point(p0, p1, p0_in_front, candidate_clipped_ps)
+  new_p1 = clip_edge_point(p1, p0, p1_in_front, candidate_clipped_ps)
+  clipped_pts = jp.stack([new_p0, new_p1])
+
+  both_in_front = sj.logical_and(p0_in_front, p1_in_front)
+  mask = sj.logical_not(sj.any(both_in_front))
+  new_ps = sj.where(mask, clipped_pts, jp.stack([p0, p1]))
+  crossing = sj.less(
+      (p0 - p1).dot(new_ps[0] - new_ps[1]) / score_scale,
+      0.0,
+      softness=softness,
+      mode=mode,
+  )
+  mask = sj.where(crossing, 0.0, mask)
+  return new_ps, jp.stack([mask, mask])
+
+
 def _clip(
     clipping_poly: jax.Array,
     subject_poly: jax.Array,
@@ -607,6 +727,67 @@ def _clip(
   return clipped_points, mask
 
 
+def _clip_soft(
+    clipping_poly: jax.Array,
+    subject_poly: jax.Array,
+    clipping_normal: jax.Array,
+    subject_normal: jax.Array,
+    mode: str,
+    softness: float,
+    scale: jax.Array,
+) -> Tuple[jax.Array, jax.Array]:
+  """Soft counterpart of `_clip` with the same fixed output shapes."""
+  clipping_p0 = jp.roll(clipping_poly, 1, axis=0)
+  clipping_plane_pts = clipping_p0
+  clipping_p1 = clipping_poly
+  clipping_plane_normals = jax.vmap(jp.cross, in_axes=[0, None])(
+      clipping_p1 - clipping_p0, clipping_normal
+  )
+
+  subject_edge_p0 = jp.roll(subject_poly, 1, axis=0)
+  subject_plane_pts = subject_edge_p0
+  subject_edge_p1 = subject_poly
+  subject_plane_normals = jax.vmap(jp.cross, in_axes=[0, None])(
+      subject_edge_p1 - subject_edge_p0, subject_normal
+  )
+
+  clipped_edges0, masks0 = jax.vmap(
+      _clip_edge_to_planes_soft,
+      in_axes=[0, 0, None, None, None, None, None],
+  )(
+      subject_edge_p0,
+      subject_edge_p1,
+      clipping_plane_pts,
+      clipping_plane_normals,
+      mode,
+      softness,
+      scale,
+  )
+
+  clipping_p0_s = _project_poly_onto_poly_plane(
+      clipping_p0, clipping_normal, subject_poly, subject_normal
+  )
+  clipping_p1_s = _project_poly_onto_poly_plane(
+      clipping_p1, clipping_normal, subject_poly, subject_normal
+  )
+  clipped_edges1, masks1 = jax.vmap(
+      _clip_edge_to_planes_soft,
+      in_axes=[0, 0, None, None, None, None, None],
+  )(
+      clipping_p0_s,
+      clipping_p1_s,
+      subject_plane_pts,
+      subject_plane_normals,
+      mode,
+      softness,
+      scale,
+  )
+
+  clipped_edges = jp.concatenate([clipped_edges0, clipped_edges1])
+  masks = jp.concatenate([masks0, masks1])
+  return clipped_edges.reshape((-1, 3)), masks.reshape(-1)
+
+
 def _create_contact_manifold(
     clipping_poly: jax.Array,
     subject_poly: jax.Array,
@@ -654,6 +835,56 @@ def _create_contact_manifold(
   pos = contact_pts
   normal = -jp.stack([sep_axis] * 4, 0)
   return dist, pos, normal
+
+
+def _create_contact_manifold_soft(
+    clipping_poly: jax.Array,
+    subject_poly: jax.Array,
+    clipping_norm: jax.Array,
+    subject_norm: jax.Array,
+    sep_axis: jax.Array,
+    mode: str,
+    softness: float,
+    scale: jax.Array,
+) -> Tuple[jax.Array, jax.Array, jax.Array]:
+  """Soft counterpart of `_create_contact_manifold`."""
+  poly_incident, mask = _clip_soft(
+      clipping_poly,
+      subject_poly,
+      clipping_norm,
+      subject_norm,
+      mode,
+      softness,
+      scale,
+  )
+  poly_ref = _project_poly_onto_plane(
+      poly_incident, clipping_poly[0], clipping_norm
+  )
+  behind_score = (
+      (poly_incident - clipping_poly[0]) @ -clipping_norm - 1e-6
+  ) / jp.maximum(scale, 1e-12)
+  behind_clipping_plane = sj.greater(
+      behind_score, 0.0, softness=softness, mode=mode
+  )
+  mask = sj.logical_and(mask, behind_clipping_plane)
+
+  best = _manifold_points_soft(
+      poly_ref,
+      mask,
+      clipping_norm,
+      mode,
+      softness,
+      scale=scale,
+  )
+  contact_pts = best @ poly_ref
+  mask_pts = best @ mask
+  incident_pts = best @ poly_incident
+  penetration_dir = incident_pts - contact_pts
+  penetration = penetration_dir.dot(-clipping_norm)
+
+  dist = sj.where(mask_pts, -penetration, jp.ones_like(penetration))
+  normal = -jp.stack([sep_axis] * 4, axis=0)
+  return dist, contact_pts, normal
 
 
 def _box_box_impl(
@@ -758,6 +989,174 @@ def _box_box_impl(
   return dist, pos, normal
 
 
+def _box_box_axes_soft(
+    normals_a: jax.Array,
+    normals_b: jax.Array,
+    unique_edges_a: jax.Array,
+    unique_edges_b: jax.Array,
+) -> Tuple[jax.Array, jax.Array]:
+  """Constructs the 15 non-redundant box SAT directions."""
+  # Box face normals are ordered as three directions followed by opposites.
+  face_axes = jp.concatenate([
+      normals_a[: normals_a.shape[0] // 2],
+      normals_b[: normals_b.shape[0] // 2],
+  ])
+  edge_dir_a = jp.tile(unique_edges_a, reps=(unique_edges_b.shape[0], 1))
+  edge_dir_b = jp.repeat(
+      unique_edges_b, repeats=unique_edges_a.shape[0], axis=0
+  )
+  edge_axes = jax.vmap(jp.cross)(edge_dir_a, edge_dir_b)
+  edge_norm_sq = jp.sum(edge_axes * edge_axes, axis=1)
+  degenerate_edge_axes = edge_norm_sq < 1e-6
+  edge_axes = jax.vmap(_safe_normalize)(edge_axes)
+  axes = jp.concatenate([face_axes, edge_axes])
+  degenerate = jp.concatenate(
+      [jp.zeros(face_axes.shape[0], dtype=bool), degenerate_edge_axes]
+  )
+  return axes, degenerate
+
+
+def _box_box_scale(vertices_a: jax.Array, vertices_b: jax.Array) -> jax.Array:
+  """Returns a translation- and rotation-invariant RMS box scale."""
+  centered_a = vertices_a - jp.mean(vertices_a, axis=0)
+  centered_b = vertices_b - jp.mean(vertices_b, axis=0)
+  radius_sq_a = jp.mean(jp.sum(centered_a * centered_a, axis=1))
+  radius_sq_b = jp.mean(jp.sum(centered_b * centered_b, axis=1))
+  return jp.sqrt(jp.maximum(0.5 * (radius_sq_a + radius_sq_b), 1e-12))
+
+
+def _box_box_impl_soft(
+    faces_a: jax.Array,
+    faces_b: jax.Array,
+    vertices_a: jax.Array,
+    vertices_b: jax.Array,
+    normals_a: jax.Array,
+    normals_b: jax.Array,
+    unique_edges_a: jax.Array,
+    unique_edges_b: jax.Array,
+    mode: str,
+    softness: float = 1e-6,
+) -> Tuple[jax.Array, jax.Array, jax.Array]:
+  """Runs a soft SAT box collision that converges to `_box_box_impl`."""
+  axes, degenerate_axes = _box_box_axes_soft(
+      normals_a, normals_b, unique_edges_a, unique_edges_b
+  )
+  n_face_axes = normals_a.shape[0] // 2 + normals_b.shape[0] // 2
+  scale = _box_box_scale(vertices_a, vertices_b)
+
+  @jax.vmap
+  def get_support(axis):
+    dot = functools.partial(jp.dot, precision=jax.lax.Precision.HIGH)
+    support_a = jax.vmap(dot, in_axes=[None, 0])(axis, vertices_a) / scale
+    support_b = jax.vmap(dot, in_axes=[None, 0])(axis, vertices_b) / scale
+    dist1 = sj.max(
+        support_a, softness=softness, mode=mode, standardize=False
+    ) - sj.min(support_b, softness=softness, mode=mode, standardize=False)
+    dist2 = sj.max(
+        support_b, softness=softness, mode=mode, standardize=False
+    ) - sj.min(support_a, softness=softness, mode=mode, standardize=False)
+    candidates = jp.stack([dist1, dist2])
+    idx = _soft_select(
+        candidates,
+        jp.ones_like(candidates),
+        mode,
+        softness,
+    )
+    dist = sj.dynamic_index_in_dim(candidates, idx, axis=0, keepdims=False)
+    sign = sj.dynamic_index_in_dim(
+        jp.array([1.0, -1.0], dtype=axis.dtype),
+        idx,
+        axis=0,
+        keepdims=False,
+    )
+    return dist, sign
+
+  support, sign = get_support(axes)
+  valid_axes = jp.logical_not(degenerate_axes)
+
+  best_face_idx = _soft_select(
+      support[:n_face_axes],
+      valid_axes[:n_face_axes],
+      mode,
+      softness,
+  )
+  best_face_axis = sj.dynamic_index_in_dim(
+      axes[:n_face_axes], best_face_idx, axis=0, keepdims=False
+  )
+  best_face_axis = _safe_normalize(best_face_axis)
+
+  best_idx = _soft_select(support, valid_axes, mode, softness)
+  best_axis = sj.dynamic_index_in_dim(axes, best_idx, axis=0, keepdims=False)
+  best_axis = _safe_normalize(best_axis)
+  best_sign = sj.dynamic_index_in_dim(sign, best_idx, axis=0, keepdims=False)
+  oriented_axes = sign[:, None] * axes
+  contact_normal = sj.dynamic_index_in_dim(
+      oriented_axes, best_idx, axis=0, keepdims=False
+  )
+  contact_normal = _safe_normalize(contact_normal)
+
+  dist_a = normals_a @ best_axis
+  dist_b = normals_b @ best_axis
+  face_valid_a = jp.ones_like(dist_a)
+  face_valid_b = jp.ones_like(dist_b)
+  a_max = _soft_select(dist_a, face_valid_a, mode, softness, maximize=True)
+  b_max = _soft_select(dist_b, face_valid_b, mode, softness, maximize=True)
+  a_min = _soft_select(dist_a, face_valid_a, mode, softness)
+  b_min = _soft_select(dist_b, face_valid_b, mode, softness)
+
+  face_a_max = sj.dynamic_index_in_dim(faces_a, a_max, axis=0, keepdims=False)
+  face_b_max = sj.dynamic_index_in_dim(faces_b, b_max, axis=0, keepdims=False)
+  face_a_min = sj.dynamic_index_in_dim(faces_a, a_min, axis=0, keepdims=False)
+  face_b_min = sj.dynamic_index_in_dim(faces_b, b_min, axis=0, keepdims=False)
+  norm_a_max = sj.dynamic_index_in_dim(normals_a, a_max, axis=0, keepdims=False)
+  norm_b_max = sj.dynamic_index_in_dim(normals_b, b_max, axis=0, keepdims=False)
+  norm_a_min = sj.dynamic_index_in_dim(normals_a, a_min, axis=0, keepdims=False)
+  norm_b_min = sj.dynamic_index_in_dim(normals_b, b_min, axis=0, keepdims=False)
+
+  choose_a = 0.5 * (best_sign + 1.0)
+  ref_face = sj.where(choose_a, face_a_max, face_b_max)
+  ref_face_norm = sj.where(choose_a, norm_a_max, norm_b_max)
+  incident_face = sj.where(choose_a, face_b_min, face_a_min)
+  incident_face_norm = sj.where(choose_a, norm_b_min, norm_a_min)
+  ref_face_norm = _safe_normalize(ref_face_norm)
+  incident_face_norm = _safe_normalize(incident_face_norm)
+
+  dist, pos, normal = _create_contact_manifold_soft(
+      ref_face,
+      incident_face,
+      ref_face_norm,
+      incident_face_norm,
+      -contact_normal,
+      mode,
+      softness,
+      scale,
+  )
+
+  edge_weight = jp.sum(best_idx[n_face_axes:])
+  alignment = sj.abs(
+      best_face_axis.dot(best_axis), mode=mode, softness=softness
+  )
+  nonparallel = sj.less(alignment, 0.99, softness=softness, mode=mode)
+  is_edge_contact = sj.logical_and(edge_weight, nonparallel)
+  deepest_idx = _soft_select(
+      dist / scale,
+      jp.ones_like(dist),
+      mode,
+      softness,
+  )
+  deepest_dist = sj.dynamic_index_in_dim(
+      dist, deepest_idx, axis=0, keepdims=False
+  )
+  deepest_pos = sj.dynamic_index_in_dim(
+      pos, deepest_idx, axis=0, keepdims=False
+  )
+  edge_dist = jp.array([deepest_dist, 1.0, 1.0, 1.0])
+  edge_pos = jp.tile(deepest_pos, (4, 1))
+  dist = sj.where(is_edge_contact, edge_dist, dist)
+  pos = sj.where(is_edge_contact, edge_pos, pos)
+  return dist, pos, normal
+
+
 def _box_box(b1: ConvexInfo, b2: ConvexInfo) -> Collision:
   """Calculates contacts between two boxes."""
   faces1 = b1.face
@@ -789,6 +1188,39 @@ def _box_box(b1: ConvexInfo, b2: ConvexInfo) -> Collision:
   n = normal @ b2.mat.T
   dist = jp.where(jp.isinf(dist), jp.finfo(dist.dtype).max, dist)
 
+  return dist, pos, n
+
+
+def _box_box_soft(
+    b1: ConvexInfo,
+    b2: ConvexInfo,
+    mode: str,
+    softness: float = 1e-6,
+) -> Collision:
+  """Soft box-box collision in the second box's local frame."""
+  to_local_pos = b2.mat.T @ (b1.pos - b2.pos)
+  to_local_mat = b2.mat.T @ b1.mat
+
+  faces1 = to_local_pos + b1.face @ to_local_mat.T
+  normals1 = b1.face_normal @ to_local_mat.T
+  vertices1 = to_local_pos + b1.vert @ to_local_mat.T
+
+  dist, pos, normal = _box_box_impl_soft(
+      faces1,
+      b2.face,
+      vertices1,
+      b2.vert,
+      normals1,
+      b2.face_normal,
+      to_local_mat.T,
+      jp.eye(3, dtype=vertices1.dtype),
+      mode,
+      softness,
+  )
+
+  pos = b2.pos + pos @ b2.mat.T
+  n = normal @ b2.mat.T
+  dist = jp.where(jp.isinf(dist), jp.finfo(dist.dtype).max, dist)
   return dist, pos, n
 
 
@@ -1013,10 +1445,12 @@ def box_box(
     softjax_mode: Optional[str],
 ) -> Collision:
   """Calculates contacts between two boxes."""
-  if soft:
-    raise NotImplementedError("Soft box-box collision not implemented")
-  dist, pos, n = _box_box(b1, b2)
-  frame = jax.vmap(math.make_frame)(n)
+  if soft and softjax_mode in ('smooth', 'c2'):
+    dist, pos, n = _box_box_soft(b1, b2, softjax_mode)
+    frame = jax.vmap(math.make_frame_soft, in_axes=[0, None])(n, softjax_mode)
+  else:
+    dist, pos, n = _box_box(b1, b2)
+    frame = jax.vmap(math.make_frame)(n)
   return dist, pos, frame
 
 
